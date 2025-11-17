@@ -1,19 +1,18 @@
 import React, { useState, useRef, useEffect } from "react";
 
 /**
-* Sonar Label Verification — High-Security Implementation (A)
-* ---------------------------------------------------------
-* Flow:
-* 1. Play a short chirp (2kHz -> 18kHz)
-* 2. Record ~CAPTURE_MS ms of mic audio via MediaRecorder
-* 3. Decode audio, split into SEGMENTS time-slices
-* 4. For each time-slice compute FFT magnitude and band energies
-* 5. Normalize per-segment and compute delta ratios between consecutive segments
-* 6. Flatten delta ratios into a single vector and compare via cosine similarity
+* Sonar Label Verification — Fixed capture implementation
+* ------------------------------------------------------
+* Replaces MediaRecorder-based recording (which can hang on some browsers/Safari)
+* with a ScriptProcessor-based direct-buffer capture using WebAudio. This is
+* more reliable across browsers and avoids MIME/MediaRecorder incompatibility.
 *
-* Notes:
-* - Designed for single-phone or cross-phone with normalization; A-level uses 50 segments
-* - Uses an internal FFT implementation (radix-2) for portability (no deps)
+* Key changes:
+* - Create AudioContext and call resume() inside the user gesture handler
+* - Use getUserMedia to obtain mic stream, connect to an AudioContext MediaStreamSource
+* - Use ScriptProcessorNode to capture float samples into buffers for CAPTURE_MS
+* - Play chirp via the same AudioContext (guarantees audio is generated during the gesture)
+* - Process the collected raw samples directly (no decode step)
 */
 
 export default function SonarVerifierApp() {
@@ -23,8 +22,10 @@ export default function SonarVerifierApp() {
  const [similarity, setSimilarity] = useState(null);
  const [status, setStatus] = useState("idle");
 
- const mediaRecorderRef = useRef(null);
- const audioChunksRef = useRef([]);
+ const audioCtxRef = useRef(null);
+ const streamRef = useRef(null);
+ const procRef = useRef(null);
+ const capturedChunksRef = useRef([]);
 
  const SEGMENTS = 50;
  const BAND_RANGES = [
@@ -36,14 +37,14 @@ export default function SonarVerifierApp() {
  ];
  const CAPTURE_MS = 700;
 
- // FFT implementation (iterative radix-2)
+ // simple iterative FFT (radix-2) returning magnitude
  function fftMag(segment, fftSize = 512) {
    const N = fftSize;
    const re = new Float64Array(N);
    const im = new Float64Array(N);
    for (let i = 0; i < Math.min(segment.length, N); i++) re[i] = segment[i];
 
-   // bit-reversal
+   // bit reversal
    let j = 0;
    for (let i = 1; i < N - 1; i++) {
      let bit = N >> 1;
@@ -89,22 +90,20 @@ export default function SonarVerifierApp() {
 
  function computeBandEnergies(mag, sampleRate, fftSize) {
    const binHz = sampleRate / fftSize;
-   const energies = BAND_RANGES.map(([low, high]) => {
+   return BAND_RANGES.map(([low, high]) => {
      let sum = 0;
      const start = Math.max(0, Math.floor(low / binHz));
      const end = Math.min(mag.length - 1, Math.floor(high / binHz));
      for (let i = start; i <= end; i++) sum += mag[i];
      return sum;
    });
-   return energies;
  }
 
- // helper: cosine similarity
  const cosineSim = (a, b) => {
    if (!a || !b || a.length !== b.length) return 0;
-   let num = 0;
-   let na = 0;
-   let nb = 0;
+   let num = 0,
+     na = 0,
+     nb = 0;
    for (let i = 0; i < a.length; i++) {
      num += a[i] * b[i];
      na += a[i] * a[i];
@@ -113,11 +112,61 @@ export default function SonarVerifierApp() {
    return num / (Math.sqrt(na) * Math.sqrt(nb) + 1e-12);
  };
 
- // capture flow: record audio blob while playing chirp, then process
+ // play chirp on provided AudioContext (returns after ended)
+ const playChirpViaCtx = (ctx, { duration = 0.25, startFreq = 2000, endFreq = 12000 } = {}) => {
+   const osc = ctx.createOscillator();
+   const gain = ctx.createGain();
+   osc.type = "sine";
+   osc.frequency.setValueAtTime(startFreq, ctx.currentTime + 0.005);
+   try {
+     osc.frequency.exponentialRampToValueAtTime(endFreq, ctx.currentTime + duration);
+   } catch (e) {
+     osc.frequency.linearRampToValueAtTime(endFreq, ctx.currentTime + duration);
+   }
+   gain.gain.setValueAtTime(0.6, ctx.currentTime + 0.005);
+   osc.connect(gain).connect(ctx.destination);
+   osc.start(ctx.currentTime + 0.005);
+   osc.stop(ctx.currentTime + duration + 0.005);
+   return new Promise((res) => {
+     osc.onended = () => {
+       try {
+         osc.disconnect();
+         gain.disconnect();
+       } catch (e) {}
+       res();
+     };
+   });
+ };
+
+ // Core: capture raw audio samples using ScriptProcessor and play chirp concurrently
  const captureAndProcess = async () => {
    setStatus("requesting-mic");
-   audioChunksRef.current = [];
+   setBandsMatrix(null);
+   setSimilarity(null);
+   capturedChunksRef.current = [];
 
+   // create/reuse AudioContext synchronously (must be in user gesture)
+   if (!audioCtxRef.current) {
+     try {
+       audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+     } catch (e) {
+       console.error("AudioContext creation failed", e);
+       setStatus("audioctx-fail");
+       return null;
+     }
+   }
+   const ctx = audioCtxRef.current;
+
+   // resume if suspended
+   if (ctx.state === "suspended") {
+     try {
+       await ctx.resume();
+     } catch (e) {
+       console.warn("AudioContext resume failed", e);
+     }
+   }
+
+   // get mic stream (this will prompt the user)
    let stream;
    try {
      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -126,59 +175,69 @@ export default function SonarVerifierApp() {
      setStatus("mic-error");
      return null;
    }
+   streamRef.current = stream;
 
-   const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/wav";
-   const mr = new MediaRecorder(stream, { mimeType });
-   mediaRecorderRef.current = mr;
+   // connect stream to audio context
+   const source = ctx.createMediaStreamSource(stream);
 
-   const chunks = [];
-   mr.ondataavailable = (ev) => chunks.push(ev.data);
+   // buffer capture using ScriptProcessorNode
+   const bufferSize = 4096; // power of two, widely supported
+   const proc = (ctx.createScriptProcessor || ctx.createJavaScriptNode).call(ctx, bufferSize, 1, 1);
+   procRef.current = proc;
 
-   const stopPromise = new Promise((resolve) => {
-     mr.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
-   });
+   proc.onaudioprocess = (e) => {
+     try {
+       const inData = e.inputBuffer.getChannelData(0);
+       // copy data to a regular Float32Array and push
+       capturedChunksRef.current.push(new Float32Array(inData));
+     } catch (err) {
+       console.warn("onaudioprocess error", err);
+     }
+   };
 
-   mr.start();
+   source.connect(proc);
+   proc.connect(ctx.destination); // connect to destination to keep node alive on some browsers
+
    setRecording(true);
    setStatus("playing-chirp");
 
-   // play chirp via AudioContext
-   const ctx = new (window.AudioContext || window.webkitAudioContext)();
-   try { await ctx.resume(); } catch (e) {}
-   const osc = ctx.createOscillator();
-   const gain = ctx.createGain();
-   const duration = 0.25;
-   const startFreq = 2000;
-   const endFreq = 18000;
+   // play chirp and capture for CAPTURE_MS
+   try {
+     // start chirp (non-blocking)
+     playChirpViaCtx(ctx, { duration: 0.25, startFreq: 2000, endFreq: 12000 }).catch((e) => console.warn(e));
+   } catch (e) {
+     console.warn("playChirp failed", e);
+   }
 
-   osc.type = "sine";
-   osc.frequency.setValueAtTime(startFreq, ctx.currentTime + 0.01);
-   osc.frequency.exponentialRampToValueAtTime(endFreq, ctx.currentTime + duration);
-   gain.gain.setValueAtTime(0.6, ctx.currentTime + 0.01);
-   osc.connect(gain).connect(ctx.destination);
-   osc.start(ctx.currentTime + 0.01);
-   osc.stop(ctx.currentTime + duration + 0.01);
+   // wait CAPTURE_MS then stop
+   await new Promise((res) => setTimeout(res, CAPTURE_MS));
 
-   // stop recording after CAPTURE_MS
-   setTimeout(() => {
-     try { mr.stop(); } catch (e) { console.warn(e); }
-     setRecording(false);
-     setStatus("processing");
-   }, CAPTURE_MS);
+   // stop capturing
+   try {
+     proc.disconnect();
+     source.disconnect();
+   } catch (e) {}
+   try {
+     // stop tracks
+     stream.getTracks().forEach((t) => t.stop());
+   } catch (e) {}
 
-   const blob = await stopPromise;
+   setRecording(false);
+   setStatus("processing");
 
-   // stop tracks
-   try { stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+   // concatenate captured chunks into a single Float32Array
+   let totalLen = 0;
+   for (const c of capturedChunksRef.current) totalLen += c.length;
+   const all = new Float32Array(totalLen);
+   let offset = 0;
+   for (const c of capturedChunksRef.current) {
+     all.set(c, offset);
+     offset += c.length;
+   }
 
-   // decode audio and compute bands matrix
-   const arrayBuffer = await blob.arrayBuffer();
-   const decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
-   const audioBuffer = await decodeCtx.decodeAudioData(arrayBuffer);
-   const sampleRate = audioBuffer.sampleRate;
-   const data = audioBuffer.getChannelData(0);
-
-   const totalSamples = data.length;
+   // now process `all` as raw samples at ctx.sampleRate
+   const sampleRate = ctx.sampleRate;
+   const totalSamples = all.length;
    const segLen = Math.floor(totalSamples / SEGMENTS) || 1;
    const fftSize = 512;
 
@@ -186,9 +245,8 @@ export default function SonarVerifierApp() {
    for (let s = 0; s < SEGMENTS; s++) {
      const start = s * segLen;
      const end = Math.min(start + segLen, totalSamples);
-     const segment = data.slice(start, end);
+     const segment = all.subarray(start, end);
 
-     // window & zero-pad to fftSize
      const windowed = new Float64Array(fftSize);
      for (let i = 0; i < fftSize; i++) {
        const x = i < segment.length ? segment[i] : 0;
@@ -201,7 +259,6 @@ export default function SonarVerifierApp() {
      bandsMat.push(energies);
    }
 
-   // normalize each segment's bands
    const normMat = bandsMat.map((arr) => {
      const sum = arr.reduce((a, b) => a + b, 1e-12);
      return arr.map((v) => v / sum);
@@ -209,7 +266,6 @@ export default function SonarVerifierApp() {
 
    setBandsMatrix(normMat);
 
-   // compute deltas (ratio cur/prev) flatten
    const deltas = [];
    for (let i = 1; i < normMat.length; i++) {
      for (let j = 0; j < normMat[0].length; j++) {
@@ -250,7 +306,6 @@ export default function SonarVerifierApp() {
    setStatus(sim > 0.92 ? "match" : "no-match");
  };
 
- // simple capture for UI (capture and display bands only)
  const handleCaptureOnly = async () => {
    setStatus("capturing-only");
    await captureAndProcess();
@@ -258,16 +313,26 @@ export default function SonarVerifierApp() {
 
  useEffect(() => {
    return () => {
-     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-       try { mediaRecorderRef.current.stop(); } catch (e) {}
-     }
+     // cleanup audio context + stream on unmount
+     try {
+       if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
+     } catch (e) {}
+     try {
+       if (procRef.current) procRef.current.disconnect();
+     } catch (e) {}
+     try {
+       if (audioCtxRef.current) {
+         audioCtxRef.current.close();
+         audioCtxRef.current = null;
+       }
+     } catch (e) {}
    };
  }, []);
 
  return (
    <div style={{ maxWidth: 760, margin: "18px auto", fontFamily: "system-ui, sans-serif" }}>
-     <h1 style={{ fontSize: 20, marginBottom: 8 }}>Sonar Label Verification — High Security (A)</h1>
-     <p style={{ marginTop: 0 }}>Protocol: play a short chirp, record ~{CAPTURE_MS} ms, slice into {SEGMENTS} segments, compute {BAND_RANGES.length} bands per segment, compute delta ratios, compare via cosine similarity.</p>
+     <h1 style={{ fontSize: 20, marginBottom: 8 }}>Sonar Label Verification — Fixed Capture</h1>
+     <p style={{ marginTop: 0 }}>Protocol: play short chirp, record ~{CAPTURE_MS} ms, slice into {SEGMENTS} segments and compute band deltas.</p>
 
      <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
        <button onClick={handleCaptureOnly} disabled={recording} style={{ padding: "10px 14px", background: "#2563eb", color: "white", border: "none", borderRadius: 8 }}>
