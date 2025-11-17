@@ -230,7 +230,7 @@ export default function SonarVerifierApp() {
          Compare to Baseline
 </button>
 </div>
-<div style={{ marginTop: 18, padding: 12, background: "#fafafa", borderRadius: 8 }}>
+<div style={{ marginTop: 18, padding: 12, background: "#35bc00ff", borderRadius: 8 }}>
 <div style={{ fontSize: 13, color: "#333", marginBottom: 8 }}>
          Status: <b>{status}</b>
 </div>
