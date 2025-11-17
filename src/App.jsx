@@ -281,7 +281,7 @@ export default function SonarVerifierApp() {
        </button>
      </div>
 
-     <div style={{ marginTop: 18, padding: 12, background: "#313613ff", borderRadius: 8 }}>
+     <div style={{ marginTop: 18, padding: 12, background: "#fafafa", borderRadius: 8 }}>
        <div style={{ fontSize: 13, color: "#333", marginBottom: 8 }}>Status: <b>{status}</b></div>
 
        <div style={{ display: "flex", gap: 12 }}>
